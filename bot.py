@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 import psycopg2
-import asyncio
 
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -41,7 +40,7 @@ def init_db():
             auto_clicker_level INTEGER DEFAULT 0,
             multiplier_level INTEGER DEFAULT 0,
             total_earned INTEGER DEFAULT 0,
-            last_save TIMESTAMP DEFAULT NOW()
+            last_auto_click TIMESTAMP DEFAULT NOW()
         );
     """)
     conn.commit()
@@ -70,7 +69,8 @@ def get_user(user_id):
             "click_power": row[4],
             "auto_clicker_level": row[5],
             "multiplier_level": row[6],
-            "total_earned": row[7]
+            "total_earned": row[7],
+            "last_auto_click": row[8]
         }
     return None
 
@@ -110,7 +110,6 @@ async def start(update: Update, context):
             "/reg логин"
         )
         return
-    # Показываем главное меню
     keyboard = [
         [InlineKeyboardButton("👆 Кликнуть", callback_data="click")],
         [InlineKeyboardButton("📊 Профиль", callback_data="profile")],
@@ -147,7 +146,24 @@ async def click(update: Update, context):
     if not user:
         await update.message.reply_text("❌ Сначала зарегистрируйся: /reg логин")
         return
-    # Начисляем монеты
+    now = datetime.now(EKAT)
+    last = user['last_auto_click']
+    if last:
+        if isinstance(last, str):
+            last = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+        diff = (now - last.replace(tzinfo=EKAT)).seconds
+        if diff >= 10 and user['auto_clicker_level'] > 0:
+            # Начисляем авто-кликер
+            auto_income = user['auto_clicker_level'] * (diff // 10)
+            new_balance = user['balance'] + auto_income
+            new_total = user['total_earned'] + auto_income
+            update_user(user_id, {
+                "balance": new_balance,
+                "total_earned": new_total,
+                "last_auto_click": now.strftime("%Y-%m-%d %H:%M:%S")
+            })
+            user = get_user(user_id)
+    # Обычный клик
     power = user['click_power'] * (2 ** user['multiplier_level'])
     new_balance = user['balance'] + power
     new_clicks = user['clicks'] + 1
@@ -157,7 +173,7 @@ async def click(update: Update, context):
         "clicks": new_clicks,
         "total_earned": new_total
     })
-    # Обновляем сообщение с балансом
+    user = get_user(user_id)
     keyboard = [
         [InlineKeyboardButton("👆 Кликнуть", callback_data="click")],
         [InlineKeyboardButton("📊 Профиль", callback_data="profile")],
@@ -297,26 +313,6 @@ async def top(update: Update, context):
         text += f"{medal} {login} — **{balance}** монет\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def auto_clicker_job(context):
-    # Авто-кликер для всех пользователей
-    conn = get_db_connection()
-    if not conn:
-        return
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, auto_clicker_level, balance, total_earned FROM clicker_users WHERE auto_clicker_level > 0")
-    users = cur.fetchall()
-    for user_id, level, balance, total in users:
-        income = level  # 1 монета за уровень
-        new_balance = balance + income
-        new_total = total + income
-        cur.execute(
-            "UPDATE clicker_users SET balance = %s, total_earned = %s WHERE user_id = %s",
-            (new_balance, new_total, user_id)
-        )
-    conn.commit()
-    cur.close()
-    conn.close()
-
 # === CALLBACK ХЕНДЛЕР ===
 async def callback_handler(update: Update, context):
     query = update.callback_query
@@ -332,26 +328,12 @@ async def callback_handler(update: Update, context):
     else:
         await shop_callback(update, context)
 
-# === ОБРАБОТКА ТЕКСТА (для команд) ===
-async def handle_text(update: Update, context):
-    text = update.message.text
-    if text.startswith("/reg"):
-        await register(update, context)
-    elif text.startswith("/start"):
-        await start(update, context)
-    else:
-        await update.message.reply_text("❌ Неизвестная команда. Используй /start")
-
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reg", register))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # Авто-кликер каждые 10 секунд
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(auto_clicker_job, interval=10, first=10)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("❌ Неизвестная команда. Используй /start")))
     print("Кликер-бот запущен...")
     app.run_polling()
 
